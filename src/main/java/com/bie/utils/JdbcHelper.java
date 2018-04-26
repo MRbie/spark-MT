@@ -27,9 +27,12 @@ public class JdbcHelper {
 	
 	//实现单例模式,懒汉式，线程安全
 	public static JdbcHelper getInstance(){
+		//两步检查机制
 		if(instance == null){
 			synchronized(JdbcHelper.class){
-				instance = new JdbcHelper();
+				if(instance == null){
+					instance = new JdbcHelper();
+				}
 			}
 		}
 		return instance;
