@@ -15,6 +15,7 @@ import com.bie.conf.ConfigurationManager;
  * @author 别先生
  * @date 2018年4月26日 
  * jdbc工具类
+ * 	正式项目一般采用框架进行开发。
  * 
  */
 public class JdbcHelper {
@@ -29,12 +30,14 @@ public class JdbcHelper {
 	public static JdbcHelper getInstance(){
 		//两步检查机制
 		if(instance == null){
+			//线程安全
 			synchronized(JdbcHelper.class){
 				if(instance == null){
 					instance = new JdbcHelper();
 				}
 			}
 		}
+		//返回创建的对象
 		return instance;
 	}
 	
@@ -79,6 +82,7 @@ public class JdbcHelper {
 	static {
 		try {
 			String driver = ConfigurationManager.getProperty(Constants.JDBC_DRIVER);
+			//加载数据库驱动
 			Class.forName(driver);
 		} catch (Exception e) {
 			e.printStackTrace();  
@@ -90,7 +94,8 @@ public class JdbcHelper {
 	 * @return
 	 */
 	public synchronized Connection getConnection(){
-		if(dataSource.size() == 0 ){
+		//判断数据库连接池是否为0
+		while(dataSource.size() == 0 ){
 			try {
 				//连接数目使用完了，进入等待状态
 				Thread.sleep(10);
@@ -99,88 +104,119 @@ public class JdbcHelper {
 				e.printStackTrace();
 			}
 		}
+		//拿到数据库连接
 		return dataSource.poll();
 	}
 	
 	
+	/***
+	 * 执行增加，删除，修改的方法
+	 * @param sql
+	 * @param params
+	 * @return
+	 */
 	public int executeUpdate(String sql, Object[] params) {
-		int rtn = 0;
+		int flag = 0;
 		Connection conn = null;
 		PreparedStatement pstmt = null;
 		try {
+			//获取到数据库连接
 			conn = getConnection();
+			//使用Connection对象，取消自动提交
 			conn.setAutoCommit(false);  
 			
+			//预处理sql语句
 			pstmt = conn.prepareStatement(sql);
-			
+			//对sql的参数字段进行处理,对?的占位符设置参数
 			if(params != null && params.length > 0) {
 				for(int i = 0; i < params.length; i++) {
 					pstmt.setObject(i + 1, params[i]);  
 				}
 			}
-			
-			rtn = pstmt.executeUpdate();
-			
+			//执行sql语句
+			flag = pstmt.executeUpdate();
+			//提交sql语句
 			conn.commit();
 		} catch (Exception e) {
 			e.printStackTrace();  
 		} finally {
 			if(conn != null) {
+				//如果资源不为null,将资源放到线程池
 				dataSource.push(conn);  
 			}
 		}
-		return rtn;
+		//返回是否执行成功的标志
+		return flag;
 	}
 	
 	
-	public void executeQuery(String sql, Object[] params, 
+	/***
+	 * 执行查询的方法
+	 * @param sql 执行查询的sql语句
+	 * @param params 执行查询的参数
+	 * @param callback 静态内部接口作为参数
+	 */
+	public void executeQuery(String sql, Object[] params,
 			QueryCallback callback) {
 		Connection conn = null;
 		PreparedStatement pstmt = null;
 		ResultSet rs = null;
 		
 		try {
+			//获取到数据库连接
 			conn = getConnection();
+			//预处理sql语句
 			pstmt = conn.prepareStatement(sql);
-			
+			//将查询的sql的占位符进行设置参数值
 			if(params != null && params.length > 0) {
 				for(int i = 0; i < params.length; i++) {
 					pstmt.setObject(i + 1, params[i]);   
 				}
 			}
-			
+			//执行查询方法
 			rs = pstmt.executeQuery();
 			
+			//根据传递的QueryCallback类型的参数处理查询的结果
 			callback.process(rs);  
 		} catch (Exception e) {
 			e.printStackTrace();
 		} finally {
 			if(conn != null) {
+				//如果conn连接不为null,就将连接放到数据库连接池中
 				dataSource.push(conn);  
 			}
 		}
 	}
 	
-	
+	/***
+	 * 执行批量删除的方法
+	 * @param sql
+	 * @param paramsList
+	 * @return 返回删除的int类型的数组
+	 */
 	public int[] executeBatch(String sql, List<Object[]> paramsList) {
 		int[] rtn = null;
 		Connection conn = null;
 		PreparedStatement pstmt = null;
 		
 		try {
+			//获取到数据库连接
 			conn = getConnection();
 			
 			// 第一步：使用Connection对象，取消自动提交
 			conn.setAutoCommit(false);  
-			
+			//预处理sql语句
 			pstmt = conn.prepareStatement(sql);
 			
 			// 第二步：使用PreparedStatement.addBatch()方法加入批量的SQL参数
 			if(paramsList != null && paramsList.size() > 0) {
+				//循环遍历参数
 				for(Object[] params : paramsList) {
+					//对参数进行设置占位符
 					for(int i = 0; i < params.length; i++) {
 						pstmt.setObject(i + 1, params[i]);  
 					}
+					//添加这个删除操作
 					pstmt.addBatch();
 				}
 			}
@@ -194,12 +230,15 @@ public class JdbcHelper {
 			e.printStackTrace();  
 		} finally {
 			if(conn != null) {
+				//如果conn连接不为null,就将conn数据库连接放到数据库连接池
 				dataSource.push(conn);  
 			}
 		}
 		
 		return rtn;
 	}
+	
+	
 	
 	/**
 	 * 静态内部类：查询回调接口
@@ -216,4 +255,8 @@ public class JdbcHelper {
 		void process(ResultSet rs) throws Exception;
 		
 	}
+	
+	
+	
+	
 }
