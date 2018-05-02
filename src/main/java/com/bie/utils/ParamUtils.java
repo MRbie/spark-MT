@@ -21,7 +21,7 @@ public class ParamUtils {
 		boolean local = ConfigurationManager.getBoolean(Constants.SPARK_LOCAL);
 		//如果值为true
 		if(local) {
-			//
+			//任务类型，根据传递进来的taskType类型进行获取值返回
 			return ConfigurationManager.getLong(taskType);  
 		} else {
 			try {
