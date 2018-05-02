@@ -2,6 +2,7 @@ package com.bie.test;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Date;
 import java.util.List;
 import java.util.Random;
 import java.util.UUID;
@@ -20,7 +21,7 @@ import com.bie.utils.StringUtils;
 
 /**
  * 模拟数据程序
- * @author Administrator
+ * @author 别先生
  *
  */
 public class MockData {
@@ -106,8 +107,9 @@ public class MockData {
 		DataFrame df = sqlContext.createDataFrame(rowsRDD, schema);
 		
 		df.registerTempTable("user_visit_action");  
+		Date today = new Date();
 		for(Row _row : df.take(1)) {
-			System.out.println(_row);  
+			System.out.println("数据输出测试：" + today.toString()  + " , "+ _row);  
 		}
 		
 		/**
@@ -143,7 +145,8 @@ public class MockData {
 		
 		DataFrame df2 = sqlContext.createDataFrame(rowsRDD, schema2);
 		for(Row _row : df2.take(1)) {
-			System.out.println(_row);  
+			//System.out.println(_row);  
+			System.out.println("数据输出测试：" + today.toString()  + " , "+ _row); 
 		}
 		
 		df2.registerTempTable("user_info");  

@@ -25,7 +25,9 @@ public class SparkUtils {
 	 * 决定，如何设置SparkConf的master
 	 */
 	public static void setMaster(SparkConf conf) {
+		//spark.local
 		boolean local = ConfigurationManager.getBoolean(Constants.SPARK_LOCAL);
+		//如果是本地模式，那么将设置为local模式
 		if(local) {
 			conf.setMaster("local");  
 		}  
@@ -53,7 +55,9 @@ public class SparkUtils {
 	 * @param sqlContext
 	 */
 	public static void mockData(JavaSparkContext sc, SQLContext sqlContext) {
+		//spark.local
 		boolean local = ConfigurationManager.getBoolean(Constants.SPARK_LOCAL);
+		//如果是本地模式，就调用测试数据，进行测试操作
 		if(local) {
 			MockData.mock(sc, sqlContext);  
 		}
