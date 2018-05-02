@@ -795,13 +795,14 @@ public class UserVisitSessionAnalyzeSpark {
 						
 						// 计算出session的访问时长和访问步长的范围，并进行相应的累加
 						//visitLength
-						long visitLength = Long.valueOf(StringUtils.getFieldFromConcatString(aggrInfo, "\\|", Constants.FIELD_VISIT_LENGTH));
+						//long visitLength = Long.valueOf(StringUtils.getFieldFromConcatString(aggrInfo, "\\|", Constants.FIELD_VISIT_LENGTH));
 						//stepLength
-						long stepLength = Long.valueOf(StringUtils.getFieldFromConcatString(aggrInfo, "\\|", Constants.FIELD_STEP_LENGTH));		
+						//long stepLength = Long.valueOf(StringUtils.getFieldFromConcatString(aggrInfo, "\\|", Constants.FIELD_STEP_LENGTH));		
 							
-						//
-						calculateVisitLength(visitLength); 
-						calculateStepLength(stepLength); 
+						//计算访问时长范围
+						//calculateVisitLength(visitLength); 
+						//计算访问步长范围
+						//calculateStepLength(stepLength); 
 						
 						return true;
 					}
@@ -896,6 +897,9 @@ public class UserVisitSessionAnalyzeSpark {
 	
 	
 	public static void main(String[] args) {
+		//设置参数,仅供测试，测试结束，注释即可
+		args = new String[]{"1"};
+		
 		//构建spark的上下文
 		SparkConf sparkConf = new SparkConf();	
 		//设置SparkName的值UserVisitSessionAnalyzeSpark
@@ -978,6 +982,12 @@ public class UserVisitSessionAnalyzeSpark {
 		JavaPairRDD<String, String> sessionid2AggrInfoRDD = 
 				aggregateBySession(sc, sqlContext, sessionid2ActionRDD);
 		
+		//单元测试,获取10条数据
+		System.out.println("过滤前行数：" +  sessionid2AggrInfoRDD.count());
+		for(Tuple2<String, String> tuple : sessionid2AggrInfoRDD.take(10)){
+			System.out.println("过滤前："  + ", " + tuple._2);
+		}
+		
 		// 接着，就要针对session粒度的聚合数据，按照使用者指定的筛选参数进行数据过滤
 		// 相当于我们自己编写的算子，是要访问外面的任务参数对象的
 		// 所以，大家记得我们之前说的，匿名内部类（算子函数），访问外部对象，是要给外部对象使用final修饰的
@@ -990,6 +1000,13 @@ public class UserVisitSessionAnalyzeSpark {
 				filterSessionAndAggrStat(sessionid2AggrInfoRDD, taskParam, sessionAggrStatAccumulator);
 		//设置级别
 		filteredSessionid2AggrInfoRDD = filteredSessionid2AggrInfoRDD.persist(StorageLevel.MEMORY_ONLY());
+		
+		//单元测试，过滤后数据输出
+		System.out.println("过滤后行数：" +  filteredSessionid2AggrInfoRDD.count());
+		for(Tuple2<String, String> tuple : filteredSessionid2AggrInfoRDD.take(10)){
+			System.out.println("过滤后："  + ", " + tuple._2);
+		}
+		
 		
 		// 生成公共的RDD：通过筛选条件的session的访问明细数据
 		

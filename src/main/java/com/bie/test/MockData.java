@@ -109,7 +109,7 @@ public class MockData {
 		df.registerTempTable("user_visit_action");  
 		Date today = new Date();
 		for(Row _row : df.take(1)) {
-			System.out.println("数据输出测试：" + today.toString()  + " , "+ _row);  
+			System.out.println("MockData的数据输出测试：" + today.toString()  + " , "+ _row);  
 		}
 		
 		/**
@@ -146,7 +146,7 @@ public class MockData {
 		DataFrame df2 = sqlContext.createDataFrame(rowsRDD, schema2);
 		for(Row _row : df2.take(1)) {
 			//System.out.println(_row);  
-			System.out.println("数据输出测试：" + today.toString()  + " , "+ _row); 
+			System.out.println("MockData的数据输出测试：" + today.toString()  + " , "+ _row); 
 		}
 		
 		df2.registerTempTable("user_info");  
@@ -176,7 +176,7 @@ public class MockData {
 		
 		DataFrame df3 = sqlContext.createDataFrame(rowsRDD, schema3);
 		for(Row _row : df3.take(1)) {
-			System.out.println(_row);  
+			System.out.println("MockData的数据输出测试：" + today.toString()  + " , " + _row);  
 		}
 		
 		df3.registerTempTable("product_info"); 
