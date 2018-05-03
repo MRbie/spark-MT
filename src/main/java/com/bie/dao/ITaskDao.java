@@ -23,7 +23,7 @@ public interface ITaskDao {
 	 * @param params
 	 * @return
 	 */
-	int insertTask(Object[] params);
+	//int insertTask(Object[] params);
 	
 	
 }

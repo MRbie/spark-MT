@@ -55,300 +55,76 @@ import it.unimi.dsi.fastutil.ints.IntArrayList;
 import it.unimi.dsi.fastutil.ints.IntList;
 import scala.Tuple2;
 
-/**
- * 用户访问session分析Spark作业
+/***
  * 
- * 接收用户创建的分析任务，用户可能指定的条件如下：
- * 
- * 1、时间范围：起始日期~结束日期
- * 2、性别：男或女
- * 3、年龄范围
- * 4、职业：多选
- * 5、城市：多选
- * 6、搜索词：多个搜索词，只要某个session中的任何一个action搜索过指定的关键词，那么session就符合条件
- * 7、点击品类：多个品类，只要某个session中的任何一个action点击过某个品类，那么session就符合条件
- * 
- * 我们的spark作业如何接受用户创建的任务？
- * 
- * J2EE平台在接收用户创建任务的请求之后，会将任务信息插入MySQL的task表中，任务参数以JSON格式封装在task_param
- * 字段中
- * 
- * 接着J2EE平台会执行我们的spark-submit shell脚本，并将taskid作为参数传递给spark-submit shell脚本
- * spark-submit shell脚本，在执行时，是可以接收参数的，并且会将接收的参数，传递给Spark作业的main函数
- * 参数就封装在main函数的args数组中
- * 
- * 这是spark本身提供的特性
- * 
- * @author Administrator
  *
+ * @author 别先生
+ * @date 2018年5月1日 
+ * 1、用户访问session分析
+ * 
  */
-@SuppressWarnings("unused")
-public class UserVisitSessionAnalyzeSpark {
-	
-	public static void main(String[] args) {
-		//设置参数,仅供测试，测试结束，注释即可
-		args = new String[]{"1"};
-		
-		// 构建Spark上下文
-		SparkConf conf = new SparkConf()
-				.setAppName(Constants.SPARK_APP_NAME_SESSION)
-//				.set("spark.default.parallelism", "100")
-				.set("spark.storage.memoryFraction", "0.5")  
-				.set("spark.shuffle.consolidateFiles", "true")
-				.set("spark.shuffle.file.buffer", "64")  
-				.set("spark.shuffle.memoryFraction", "0.3")    
-				.set("spark.reducer.maxSizeInFlight", "24")  
-				.set("spark.shuffle.io.maxRetries", "60")  
-				.set("spark.shuffle.io.retryWait", "60")   
-				.set("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
-				.registerKryoClasses(new Class[]{
-						CategorySortKey.class,
-						IntList.class});   
-		SparkUtils.setMaster(conf); 
-		
-		/**
-		 * 比如，获取top10热门品类功能中，二次排序，自定义了一个Key
-		 * 那个key是需要在进行shuffle的时候，进行网络传输的，因此也是要求实现序列化的
-		 * 启用Kryo机制以后，就会用Kryo去序列化和反序列化CategorySortKey
-		 * 所以这里要求，为了获取最佳性能，注册一下我们自定义的类
-		 */
-		
-		JavaSparkContext sc = new JavaSparkContext(conf);
-//		sc.checkpointFile("hdfs://");
-		SQLContext sqlContext = getSQLContext(sc.sc());
-		
-		// 生成模拟测试数据
-		SparkUtils.mockData(sc, sqlContext);  
-		
-		// 创建需要使用的DAO组件
-		ITaskDao taskDAO = DaoFactory.getTaskDao();
-		
-		// 首先得查询出来指定的任务，并获取任务的查询参数
-		long taskid = ParamUtils.getTaskIdFromArgs(args, Constants.SPARK_LOCAL_TASKID_SESSION);
-		Task task = taskDAO.findById(taskid);
-		if(task == null) {
-			System.out.println(new Date() + ": cannot find this task with id [" + taskid + "].");  
-			return;
-		}
-		
-		JSONObject taskParam = JSONObject.parseObject(task.getTaskParam());
-		
-		// 如果要进行session粒度的数据聚合
-		// 首先要从user_visit_action表中，查询出来指定日期范围内的行为数据
-		
-		/**
-		 * actionRDD，就是一个公共RDD
-		 * 第一，要用ationRDD，获取到一个公共的sessionid为key的PairRDD
-		 * 第二，actionRDD，用在了session聚合环节里面
-		 * 
-		 * sessionid为key的PairRDD，是确定了，在后面要多次使用的
-		 * 1、与通过筛选的sessionid进行join，获取通过筛选的session的明细数据
-		 * 2、将这个RDD，直接传入aggregateBySession方法，进行session聚合统计
-		 * 
-		 * 重构完以后，actionRDD，就只在最开始，使用一次，用来生成以sessionid为key的RDD
-		 * 
-		 */
-		JavaRDD<Row> actionRDD = SparkUtils.getActionRDDByDateRange(sqlContext, taskParam);
-		JavaPairRDD<String, Row> sessionid2actionRDD = getSessionid2ActionRDD(actionRDD);
-		
-		/**
-		 * 持久化，很简单，就是对RDD调用persist()方法，并传入一个持久化级别
-		 * 
-		 * 如果是persist(StorageLevel.MEMORY_ONLY())，纯内存，无序列化，那么就可以用cache()方法来替代
-		 * StorageLevel.MEMORY_ONLY_SER()，第二选择
-		 * StorageLevel.MEMORY_AND_DISK()，第三选择
-		 * StorageLevel.MEMORY_AND_DISK_SER()，第四选择
-		 * StorageLevel.DISK_ONLY()，第五选择
-		 * 
-		 * 如果内存充足，要使用双副本高可靠机制
-		 * 选择后缀带_2的策略
-		 * StorageLevel.MEMORY_ONLY_2()
-		 * 
-		 */
-		sessionid2actionRDD = sessionid2actionRDD.persist(StorageLevel.MEMORY_ONLY());
-//		sessionid2actionRDD.checkpoint();
-		
-		// 首先，可以将行为数据，按照session_id进行groupByKey分组
-		// 此时的数据的粒度就是session粒度了，然后呢，可以将session粒度的数据
-		// 与用户信息数据，进行join
-		// 然后就可以获取到session粒度的数据，同时呢，数据里面还包含了session对应的user的信息
-		// 到这里为止，获取的数据是<sessionid,(sessionid,searchKeywords,clickCategoryIds,age,professional,city,sex)>  
-		JavaPairRDD<String, String> sessionid2AggrInfoRDD = 
-				aggregateBySession(sc, sqlContext, sessionid2actionRDD);
-		
-		System.out.println("过滤前行数：" +  sessionid2AggrInfoRDD.count());
-		for(Tuple2<String, String> tuple : sessionid2AggrInfoRDD.take(10)){
-			System.out.println("过滤前："  + ", " + tuple._2);
-		}
-		
-		// 接着，就要针对session粒度的聚合数据，按照使用者指定的筛选参数进行数据过滤
-		// 相当于我们自己编写的算子，是要访问外面的任务参数对象的
-		// 所以，大家记得我们之前说的，匿名内部类（算子函数），访问外部对象，是要给外部对象使用final修饰的
-		
-		// 重构，同时进行过滤和统计
-		Accumulator<String> sessionAggrStatAccumulator = sc.accumulator(
-				"", new SessionAggrStatAccumulator());
-		
-		JavaPairRDD<String, String> filteredSessionid2AggrInfoRDD = filterSessionAndAggrStat(
-				sessionid2AggrInfoRDD, taskParam, sessionAggrStatAccumulator);
-		filteredSessionid2AggrInfoRDD = filteredSessionid2AggrInfoRDD.persist(StorageLevel.MEMORY_ONLY());
-		
-		//单元测试，过滤后数据输出
-		System.out.println("过滤后行数：" +  filteredSessionid2AggrInfoRDD.count());
-		for(Tuple2<String, String> tuple : filteredSessionid2AggrInfoRDD.take(10)){
-			System.out.println("过滤后："  + ", " + tuple._2);
-		}
-		
-		// 生成公共的RDD：通过筛选条件的session的访问明细数据
-		
-		/**
-		 * 重构：sessionid2detailRDD，就是代表了通过筛选的session对应的访问明细数据
-		 */
-		//JavaPairRDD<String, Row> sessionid2detailRDD = getSessionid2detailRDD(
-		//		filteredSessionid2AggrInfoRDD, sessionid2actionRDD);
-		//sessionid2detailRDD = sessionid2detailRDD.persist(StorageLevel.MEMORY_ONLY());
-		
-		/**
-		 * 对于Accumulator这种分布式累加计算的变量的使用，有一个重要说明
-		 * 
-		 * 从Accumulator中，获取数据，插入数据库的时候，一定要，一定要，是在有某一个action操作以后
-		 * 再进行。。。
-		 * 
-		 * 如果没有action的话，那么整个程序根本不会运行。。。
-		 * 
-		 * 是不是在calculateAndPersisitAggrStat方法之后，运行一个action操作，比如count、take
-		 * 不对！！！
-		 * 
-		 * 必须把能够触发job执行的操作，放在最终写入MySQL方法之前
-		 * 
-		 * 计算出来的结果，在J2EE中，是怎么显示的，是用两张柱状图显示
-		 */
-		
-		//randomExtractSession(sc, task.getTaskid(), 
-		//		filteredSessionid2AggrInfoRDD, sessionid2detailRDD);
-		
-		/**
-		 * 特别说明
-		 * 我们知道，要将上一个功能的session聚合统计数据获取到，就必须是在一个action操作触发job之后
-		 * 才能从Accumulator中获取数据，否则是获取不到数据的，因为没有job执行，Accumulator的值为空
-		 * 所以，我们在这里，将随机抽取的功能的实现代码，放在session聚合统计功能的最终计算和写库之前
-		 * 因为随机抽取功能中，有一个countByKey算子，是action操作，会触发job
-		 */
-		
-		// 计算出各个范围的session占比，并写入MySQL
-		calculateAndPersistAggrStat(sessionAggrStatAccumulator.value(),
-				task.getTaskid());
-		
-		/**
-		 * session聚合统计（统计出访问时长和访问步长，各个区间的session数量占总session数量的比例）
-		 * 
-		 * 如果不进行重构，直接来实现，思路：
-		 * 1、actionRDD，映射成<sessionid,Row>的格式
-		 * 2、按sessionid聚合，计算出每个session的访问时长和访问步长，生成一个新的RDD
-		 * 3、遍历新生成的RDD，将每个session的访问时长和访问步长，去更新自定义Accumulator中的对应的值
-		 * 4、使用自定义Accumulator中的统计值，去计算各个区间的比例
-		 * 5、将最后计算出来的结果，写入MySQL对应的表中
-		 * 
-		 * 普通实现思路的问题：
-		 * 1、为什么还要用actionRDD，去映射？其实我们之前在session聚合的时候，映射已经做过了。多此一举
-		 * 2、是不是一定要，为了session的聚合这个功能，单独去遍历一遍session？其实没有必要，已经有session数据
-		 * 		之前过滤session的时候，其实，就相当于，是在遍历session，那么这里就没有必要再过滤一遍了
-		 * 
-		 * 重构实现思路：
-		 * 1、不要去生成任何新的RDD（处理上亿的数据）
-		 * 2、不要去单独遍历一遍session的数据（处理上千万的数据）
-		 * 3、可以在进行session聚合的时候，就直接计算出来每个session的访问时长和访问步长
-		 * 4、在进行过滤的时候，本来就要遍历所有的聚合session信息，此时，就可以在某个session通过筛选条件后
-		 * 		将其访问时长和访问步长，累加到自定义的Accumulator上面去
-		 * 5、就是两种截然不同的思考方式，和实现方式，在面对上亿，上千万数据的时候，甚至可以节省时间长达
-		 * 		半个小时，或者数个小时
-		 * 
-		 * 开发Spark大型复杂项目的一些经验准则：
-		 * 1、尽量少生成RDD
-		 * 2、尽量少对RDD进行算子操作，如果有可能，尽量在一个算子里面，实现多个需要做的功能
-		 * 3、尽量少对RDD进行shuffle算子操作，比如groupByKey、reduceByKey、sortByKey（map、mapToPair）
-		 * 		shuffle操作，会导致大量的磁盘读写，严重降低性能
-		 * 		有shuffle的算子，和没有shuffle的算子，甚至性能，会达到几十分钟，甚至数个小时的差别
-		 * 		有shfufle的算子，很容易导致数据倾斜，一旦数据倾斜，简直就是性能杀手（完整的解决方案）
-		 * 4、无论做什么功能，性能第一
-		 * 		在传统的J2EE或者.NET后者PHP，软件/系统/网站开发中，我认为是架构和可维护性，可扩展性的重要
-		 * 		程度，远远高于了性能，大量的分布式的架构，设计模式，代码的划分，类的划分（高并发网站除外）
-		 * 
-		 * 		在大数据项目中，比如MapReduce、Hive、Spark、Storm，我认为性能的重要程度，远远大于一些代码
-		 * 		的规范，和设计模式，代码的划分，类的划分；大数据，大数据，最重要的，就是性能
-		 * 		主要就是因为大数据以及大数据项目的特点，决定了，大数据的程序和项目的速度，都比较慢
-		 * 		如果不优先考虑性能的话，会导致一个大数据处理程序运行时间长度数个小时，甚至数十个小时
-		 * 		此时，对于用户体验，简直就是一场灾难
-		 * 		
-		 * 		所以，推荐大数据项目，在开发和代码的架构中，优先考虑性能；其次考虑功能代码的划分、解耦合
-		 * 
-		 * 		我们如果采用第一种实现方案，那么其实就是代码划分（解耦合、可维护）优先，设计优先
-		 * 		如果采用第二种方案，那么其实就是性能优先
-		 * 
-		 * 		讲了这么多，其实大家不要以为我是在岔开话题，大家不要觉得项目的课程，就是单纯的项目本身以及
-		 * 		代码coding最重要，其实项目，我觉得，最重要的，除了技术本身和项目经验以外；非常重要的一点，就是
-		 * 		积累了，处理各种问题的经验
-		 * 
-		 */
-		
-		// 获取top10热门品类
-		//List<Tuple2<CategorySortKey, String>> top10CategoryList = 
-		//		getTop10Category(task.getTaskid(), sessionid2detailRDD);
-		
-		// 获取top10活跃session
-		//getTop10Session(sc, task.getTaskid(), 
-		//		top10CategoryList, sessionid2detailRDD);
-		
-		// 关闭Spark上下文
-		sc.close(); 
-	}
+public class UserVisitSessionAnalyzeSpark2 {
 
 	/**
-	 * 获取SQLContext
+	 * 1、获取SQLContext
 	 * 如果是在本地测试环境的话，那么就生成SQLContext对象
 	 * 如果是在生产环境运行的话，那么就生成HiveContext对象
 	 * @param sc SparkContext
-	 * @return SQLContext
+	 * @return
 	 */
-	private static SQLContext getSQLContext(SparkContext sc) {
-		boolean local = ConfigurationManager.getBoolean(Constants.SPARK_LOCAL);
-		if(local) {
+	@SuppressWarnings("unused")
+	private static SQLContext getSQLContext(SparkContext sc){
+		//spark.local=true,本地模式默认为true。
+		Boolean local = ConfigurationManager.getBoolean(Constants.SPARK_LOCAL);
+		//如果是本地模式就创建一个SQLContext对象。
+		if(local){
 			return new SQLContext(sc);
-		} else {
+		}else{
+			//如果不是本地模式，就创建一个HiveContext对象。
 			return new HiveContext(sc);
 		}
 	}
 	
-	/**
-	 * 生成模拟数据（只有本地模式，才会去生成模拟数据）
-	 * @param sc 
+	
+	/***
+	 * 2、生成模拟数据（只有本地模式，才会去生成模拟数据）
+	 * 生成模拟数据
+	 * @param sc
 	 * @param sqlContext
 	 */
-	private static void mockData(JavaSparkContext sc, SQLContext sqlContext) {
-		boolean local = ConfigurationManager.getBoolean(Constants.SPARK_LOCAL);
-		if(local) {
-			MockData.mock(sc, sqlContext);  
+	@SuppressWarnings("unused")
+	private static void mockData(JavaSparkContext sc ,SQLContext sqlContext ){
+		//是否是本地模式
+		Boolean local = ConfigurationManager.getBoolean(Constants.SPARK_LOCAL);
+		if(local){
+			//如果是本地模式，就调用测试数据进行测试
+			MockData.mock(sc, sqlContext);
 		}
 	}
 	
+	
 	/**
-	 * 获取指定日期范围内的用户访问行为数据
+	 * 3、获取指定日期范围内的用户访问行为数据
 	 * @param sqlContext SQLContext
-	 * @param taskParam 任务参数
+	 * @param jsonObject 任务参数
 	 * @return 行为数据RDD
 	 */
-	private static JavaRDD<Row> getActionRDDByDateRange(
-			SQLContext sqlContext, JSONObject taskParam) {
+	@SuppressWarnings("unused")
+	private static JavaRDD<Row> getActionRDDByDateRange(SQLContext sqlContext,
+			JSONObject taskParam){
+		//获取到startDate日期
 		String startDate = ParamUtils.getParam(taskParam, Constants.PARAM_START_DATE);
+		//获取到endDate日期
 		String endDate = ParamUtils.getParam(taskParam, Constants.PARAM_END_DATE);
 		
-		String sql = 
-				"select * "
+		//执行的sql语句
+		//规律，在双引号内部，'' "" ++ 
+		String sql = "select * "
 				+ "from user_visit_action "
-				+ "where date>='" + startDate + "' "
-				+ "and date<='" + endDate + "'";  
-//				+ "and session_id not in('','','')"
-		
+				+ "where date >= '" + startDate + "' "
+				+ "and date <= '"+ endDate +"' ";
+//				+ "and session_id not in('','','')" ;
+		//执行sql
 		DataFrame actionDF = sqlContext.sql(sql);
 		
 		/**
@@ -359,188 +135,209 @@ public class UserVisitSessionAnalyzeSpark {
 		 * 所以说，在这里，就可以对Spark SQL刚刚查询出来的RDD执行repartition重分区操作
 		 */
 		
-//		return actionDF.javaRDD().repartition(1000);
+		//return actionDF.javaRDD().repartition(1000);
 		
 		return actionDF.javaRDD();
 	}
 	
 	/**
-	 * 获取sessionid2到访问行为数据的映射的RDD
-	 * @param actionRDD 
+	 * 4、获取sessionid2到访问行为数据的映射的RDD
+	 * @param actionRDD
 	 * @return
+	 * 匿名内部类
 	 */
-	public static JavaPairRDD<String, Row> getSessionid2ActionRDD(JavaRDD<Row> actionRDD) {
-//		return actionRDD.mapToPair(new PairFunction<Row, String, Row>() {
-//
-//			private static final long serialVersionUID = 1L;
-//			
-//			@Override
-//			public Tuple2<String, Row> call(Row row) throws Exception {
-//				return new Tuple2<String, Row>(row.getString(2), row);  
-//			}
-//			
-//		});
-		
+	@SuppressWarnings("unused")
+	private static JavaPairRDD<String, Row> getSessionid2ActionRDD(JavaRDD<Row> actionRDD){
 		return actionRDD.mapPartitionsToPair(new PairFlatMapFunction<Iterator<Row>, String, Row>() {
 
+			/**
+			 * 序列化操作
+			 */
 			private static final long serialVersionUID = 1L;
 
 			@Override
-			public Iterable<Tuple2<String, Row>> call(Iterator<Row> iterator)
-					throws Exception {
+			public Iterable<Tuple2<String, Row>> call(Iterator<Row> iterator) throws Exception {
+				//实例化一个对象list，Tuple2<String,Row>是scala类型的
 				List<Tuple2<String, Row>> list = new ArrayList<Tuple2<String, Row>>();
-				
-				while(iterator.hasNext()) {
+				//循环遍历
+				while(iterator.hasNext()){
+					//遍历出这row
 					Row row = iterator.next();
-					list.add(new Tuple2<String, Row>(row.getString(2), row));  
+					//然后对row进行添加到list中
+					list.add(new Tuple2<String, Row>(row.getString(2), row));
 				}
-				
 				return list;
 			}
-			
 		});
 	}
 	
-	/**
-	 * 对行为数据按session粒度进行聚合
-	 * @param actionRDD 行为数据RDD
+	
+	/***
+	 * 5、对行文数据按照session粒度进行聚合
+	 * @param sc JavaSparkContext 
+	 * @param sqlContext SQLContext
+	 * @param sessionid2actionRDD JavaPairRDD<String, Row>
 	 * @return session粒度聚合数据
 	 */
+	@SuppressWarnings("unused")
 	private static JavaPairRDD<String, String> aggregateBySession(
-			JavaSparkContext sc,
-			SQLContext sqlContext, 
-			JavaPairRDD<String, Row> sessinoid2actionRDD) {
+			JavaSparkContext sc, SQLContext sqlContext, 
+			JavaPairRDD<String, Row> sessionid2actionRDD){
+		//现在actionRDD中的元素是Row,一个Row就是一行用户访问行为记录，比如一次点击或者搜索
+		//我们现在需要将这个Row映射成<sessionid,Row>的格式
+		
+		
 		// 对行为数据按session粒度进行分组
 		JavaPairRDD<String, Iterable<Row>> sessionid2ActionsRDD = 
-				sessinoid2actionRDD.groupByKey();
+				sessionid2actionRDD.groupByKey();
+		
 		
 		// 对每一个session分组进行聚合，将session中所有的搜索词和点击品类都聚合起来
-		// 到此为止，获取的数据格式，如下：<userid,partAggrInfo(sessionid,searchKeywords,clickCategoryIds)>
+		// 到此为止，获取的数据格式，如下：
+		//<userid,partAggrInfo(sessionid,searchKeywords,clickCategoryIds)>
 		JavaPairRDD<Long, String> userid2PartAggrInfoRDD = sessionid2ActionsRDD.mapToPair(
+			
+			/**
+			 * PairFunction
+			 * 参数一，相当于函数的输入
+			 * 参数2和参数3，相当于是函数的输出(tuple),分别是Tuple第一个和第二个值
+			 */
+			new PairFunction<Tuple2<String,Iterable<Row>>, Long, String>() {
+
+			/**
+			 * 
+			 */
+			private static final long serialVersionUID = 1L;
+
+			@Override
+			public Tuple2<Long, String> call(Tuple2<String, Iterable<Row>> tuple) throws Exception {
+				//获取到sessionid
+				String sessionid = tuple._1;
+				//获取到一行信息
+				Iterator<Row> iterator = tuple._2.iterator();
 				
-				new PairFunction<Tuple2<String,Iterable<Row>>, Long, String>() {
+				StringBuffer searchKeywordsBuffer = new StringBuffer("");
+				StringBuffer clickCategoryIdsBuffer = new StringBuffer("");
+				
+				Long userid = null;
+				//session的起始和结束时间
+				Date startTime = null;
+				Date endTime = null;
+				//session的访问步长
+				int stepLength = 0;
+				
+				//遍历session所有的访问行为
+				while(iterator.hasNext()){
+					//提取每个访问行为的搜索词字段和点击品字段
+					Row row = iterator.next();
+					if(userid == null){
+						userid = row.getLong(1);
+					}
+					String searchKeyword = row.getString(5);
+					Long clickCategoryId = row.getLong(6);
 					
-					private static final long serialVersionUID = 1L;
-		
-					@Override
-					public Tuple2<Long, String> call(Tuple2<String, Iterable<Row>> tuple)
-							throws Exception {
-						String sessionid = tuple._1;
-						Iterator<Row> iterator = tuple._2.iterator();
-						
-						StringBuffer searchKeywordsBuffer = new StringBuffer("");
-						StringBuffer clickCategoryIdsBuffer = new StringBuffer("");
-						
-						Long userid = null;
-						
-						// session的起始和结束时间
-						Date startTime = null;
-						Date endTime = null;
-						// session的访问步长
-						int stepLength = 0;
-						
-						// 遍历session所有的访问行为
-						while(iterator.hasNext()) {
-							// 提取每个访问行为的搜索词字段和点击品类字段
-							Row row = iterator.next();
-							if(userid == null) {
-								userid = row.getLong(1);
-							}
-							String searchKeyword = row.getString(5);
-							Long clickCategoryId = row.getLong(6);
-							
-							// 实际上这里要对数据说明一下
-							// 并不是每一行访问行为都有searchKeyword何clickCategoryId两个字段的
-							// 其实，只有搜索行为，是有searchKeyword字段的
-							// 只有点击品类的行为，是有clickCategoryId字段的
-							// 所以，任何一行行为数据，都不可能两个字段都有，所以数据是可能出现null值的
-							
-							// 我们决定是否将搜索词或点击品类id拼接到字符串中去
-							// 首先要满足：不能是null值
-							// 其次，之前的字符串中还没有搜索词或者点击品类id
-							
-							if(StringUtils.isNotEmpty(searchKeyword)) {
-								if(!searchKeywordsBuffer.toString().contains(searchKeyword)) {
-									searchKeywordsBuffer.append(searchKeyword + ",");  
-								}
-							}
-							if(clickCategoryId != null) {
-								if(!clickCategoryIdsBuffer.toString().contains(
-										String.valueOf(clickCategoryId))) {   
-									clickCategoryIdsBuffer.append(clickCategoryId + ",");  
-								}
-							}
-							
-							// 计算session开始和结束时间
-							Date actionTime = DateUtils.parseTime(row.getString(4));
-							
-							if(startTime == null) {
-								startTime = actionTime;
-							}
-							if(endTime == null) {
-								endTime = actionTime;
-							}
-							
-							if(actionTime.before(startTime)) {
-								startTime = actionTime;
-							}
-							if(actionTime.after(endTime)) {
-								endTime = actionTime;
-							}
-							
-							// 计算session访问步长
-							stepLength++;
+					// 实际上这里要对数据说明一下
+					// 并不是每一行访问行为都有searchKeyword何clickCategoryId两个字段的
+					// 其实，只有搜索行为，是有searchKeyword字段的
+					// 只有点击品类的行为，是有clickCategoryId字段的
+					// 所以，任何一行行为数据，都不可能两个字段都有，所以数据是可能出现null值的
+					
+					// 我们决定是否将搜索词或点击品类id拼接到字符串中去
+					// 首先要满足：不能是null值
+					// 其次，之前的字符串中还没有搜索词或者点击品类id
+					
+					//进行判断searchKeyword是否为null和是否存在
+					if(StringUtils.isNotEmpty(searchKeyword)){
+						if(!searchKeywordsBuffer.toString().contains(searchKeyword)){
+							searchKeywordsBuffer.append(searchKeyword);
 						}
-						
-						String searchKeywords = StringUtils.trimComma(searchKeywordsBuffer.toString());
-						String clickCategoryIds = StringUtils.trimComma(clickCategoryIdsBuffer.toString());
-						
-						// 计算session访问时长（秒）
-						long visitLength = (endTime.getTime() - startTime.getTime()) / 1000; 
-						
-						// 大家思考一下
-						// 我们返回的数据格式，即使<sessionid,partAggrInfo>
-						// 但是，这一步聚合完了以后，其实，我们是还需要将每一行数据，跟对应的用户信息进行聚合
-						// 问题就来了，如果是跟用户信息进行聚合的话，那么key，就不应该是sessionid
-						// 就应该是userid，才能够跟<userid,Row>格式的用户信息进行聚合
-						// 如果我们这里直接返回<sessionid,partAggrInfo>，还得再做一次mapToPair算子
-						// 将RDD映射成<userid,partAggrInfo>的格式，那么就多此一举
-						
-						// 所以，我们这里其实可以直接，返回的数据格式，就是<userid,partAggrInfo>
-						// 然后跟用户信息join的时候，将partAggrInfo关联上userInfo
-						// 然后再直接将返回的Tuple的key设置成sessionid
-						// 最后的数据格式，还是<sessionid,fullAggrInfo>
-						
-						// 聚合数据，用什么样的格式进行拼接？
-						// 我们这里统一定义，使用key=value|key=value
-						String partAggrInfo = Constants.FIELD_SESSION_ID + "=" + sessionid + "|"
-								+ Constants.FIELD_SEARCH_KEYWORDS + "=" + searchKeywords + "|"
-								+ Constants.FIELD_CLICK_CATEGORY_IDS + "=" + clickCategoryIds + "|"
-								+ Constants.FIELD_VISIT_LENGTH + "=" + visitLength + "|"
-								+ Constants.FIELD_STEP_LENGTH + "=" + stepLength + "|"
-								+ Constants.FIELD_START_TIME + "=" + DateUtils.formatTime(startTime);    
-						
-						return new Tuple2<Long, String>(userid, partAggrInfo);
+					}
+					//Long类型可以判断不为null
+					if(clickCategoryId != null){
+						if(!clickCategoryIdsBuffer.toString().contains(String.valueOf(clickCategoryId))){
+							clickCategoryIdsBuffer.append(clickCategoryId + ",");
+						}
 					}
 					
-				});
+					//计算session开始和结束的时间
+					Date actionTime = DateUtils.parseTime(row.getString(4));
+					//startTime为null
+					if(startTime == null){
+						startTime = actionTime;
+					}
+					//endTime为null，将actionTime赋值给endTime和startTime
+					if(endTime == null){
+						endTime = actionTime;
+					}
+					
+					//actionTime在startTime之前
+					if(actionTime.before(startTime)){
+						startTime = actionTime;
+					}
+					//actionTime在startTime之后
+					if(actionTime.after(endTime)){
+						endTime = actionTime;
+					}
+			
+					//计算session的访问步长
+					stepLength++;
+				}
+				
+				//截断字符串两侧的逗号
+				String searchKeywords = StringUtils.trimComma(searchKeywordsBuffer.toString());
+				String clickCategoryIds = StringUtils.trimComma(clickCategoryIdsBuffer.toString());
+				
+				//计算session的访问时长（s）
+				long visitLength = (endTime.getTime() - startTime.getTime()) / 1000;
+				
+				
+				// 大家思考一下
+				// 我们返回的数据格式，其实<sessionid,partAggrInfo>
+				// 但是，这一步聚合完了以后，其实，我们是还需要将每一行数据，跟对应的用户信息进行聚合
+				// 问题就来了，如果是跟用户信息进行聚合的话，那么key，就不应该是sessionid
+				// 就应该是userid，才能够跟<userid,Row>格式的用户信息进行聚合
+				// 如果我们这里直接返回<sessionid,partAggrInfo>，还得再做一次mapToPair算子
+				// 将RDD映射成<userid,partAggrInfo>的格式，那么就多此一举
+				
+				// 所以，我们这里其实可以直接，返回的数据格式，就是<userid,partAggrInfo>
+				// 然后跟用户信息join的时候，将partAggrInfo关联上userInfo
+				// 然后再直接将返回的Tuple的key设置成sessionid
+				// 最后的数据格式，还是<sessionid,fullAggrInfo>
+				
+				// 聚合数据，用什么样的格式进行拼接？
+				// 我们这里统一定义，使用key=value|key=value
+				
+				String partAggrInfo = Constants.FIELD_SESSION_ID + "=" + sessionid + "|"
+						+ Constants.FIELD_SEARCH_KEYWORDS + "=" + searchKeywords + "|"
+						+ Constants.FIELD_CLICK_CATEGORY_IDS + "=" + visitLength + "|"
+						+ Constants.FIELD_STEP_LENGTH + "=" + stepLength + "|"
+						+ Constants.FIELD_START_TIME + "=" + DateUtils.formatTime(startTime)
+						;
+				return new Tuple2<Long, String>(userid, partAggrInfo);
+			}
+		});
 		
-		// 查询所有用户数据，并映射成<userid,Row>的格式
-		String sql = "select * from user_info";  
+		//查询所有用户的数据，并且映射成<userid,Row>的格式
+		String sql = "select * from user_info ";
 		JavaRDD<Row> userInfoRDD = sqlContext.sql(sql).javaRDD();
 		
+		//将查询的数据进行映射为<userid,row>格式的数据
 		JavaPairRDD<Long, Row> userid2InfoRDD = userInfoRDD.mapToPair(
 				
 				new PairFunction<Row, Long, Row>() {
 
+					/**
+					 * 
+					 */
 					private static final long serialVersionUID = 1L;
 
 					@Override
 					public Tuple2<Long, Row> call(Row row) throws Exception {
+						//获取到第一个userid的值
 						return new Tuple2<Long, Row>(row.getLong(0), row);
 					}
 					
-				});
+		});
 		
 		/**
 		 * 这里就可以说一下，比较适合采用reduce join转换为map join的方式
@@ -550,42 +347,52 @@ public class UserVisitSessionAnalyzeSpark {
 		 * 
 		 */
 		
-		// 将session粒度聚合数据，与用户信息进行join
+		//将session粒度聚合数据，与用户信息进行Join
+		//格式<userid,Tuple<String, Row>>
 		JavaPairRDD<Long, Tuple2<String, Row>> userid2FullInfoRDD = 
 				userid2PartAggrInfoRDD.join(userid2InfoRDD);
 		
-		// 对join起来的数据进行拼接，并且返回<sessionid,fullAggrInfo>格式的数据
+		//对join起来的数据进行拼接，并且返回<sessionid,fullAggrInfo>格式的数据
 		JavaPairRDD<String, String> sessionid2FullAggrInfoRDD = userid2FullInfoRDD.mapToPair(
 				
 				new PairFunction<Tuple2<Long,Tuple2<String,Row>>, String, String>() {
 
+					/**
+					 * 
+					 */
 					private static final long serialVersionUID = 1L;
 
 					@Override
-					public Tuple2<String, String> call(
-							Tuple2<Long, Tuple2<String, Row>> tuple)
-							throws Exception {
+					public Tuple2<String, String> call(Tuple2<Long, Tuple2<String, Row>> tuple) throws Exception {
+						//重点详细关注这一块到底如何获取和获取的是什么
+						//partAggrInfo的位置是第二个
 						String partAggrInfo = tuple._2._1;
 						Row userInfoRow = tuple._2._2;
 						
-						String sessionid = StringUtils.getFieldFromConcatString(
-								partAggrInfo, "\\|", Constants.FIELD_SESSION_ID);
+						//从拼接的字符串中提取字段，获取到sessionid的值
+						String sessionid = StringUtils.getFieldFromConcatString(partAggrInfo, "\\|", Constants.FIELD_SESSION_ID);
 						
+						//获取到age年龄的值
 						int age = userInfoRow.getInt(3);
+						//获取到professional
 						String professional = userInfoRow.getString(4);
+						//获取到城市的值
 						String city = userInfoRow.getString(5);
+						//获取到sex的值
 						String sex = userInfoRow.getString(6);
 						
+						//进行字符串的拼接操作
 						String fullAggrInfo = partAggrInfo + "|"
 								+ Constants.FIELD_AGE + "=" + age + "|"
 								+ Constants.FIELD_PROFESSIONAL + "=" + professional + "|"
 								+ Constants.FIELD_CITY + "=" + city + "|"
-								+ Constants.FIELD_SEX + "=" + sex;
+								+ Constants.FIELD_SEX + "=" + sex + "|"
+								;
 						
 						return new Tuple2<String, String>(sessionid, fullAggrInfo);
 					}
-					
-				});
+		});
+		
 		
 		/**
 		 * reduce join转换为map join
@@ -880,117 +687,146 @@ public class UserVisitSessionAnalyzeSpark {
 //					
 //				});
 		
+		
 		return sessionid2FullAggrInfoRDD;
 	}
 	
-	/**
-	 * 过滤session数据，并进行聚合统计
+	
+	/***
+	 * 6、过滤session数据，并进行聚合统计操作
 	 * @param sessionid2AggrInfoRDD
-	 * @return 
+	 * @param taskParam
+	 * @param sessionAggrStatAccumulator
+	 * @return
 	 */
+	@SuppressWarnings("unused")
 	private static JavaPairRDD<String, String> filterSessionAndAggrStat(
 			JavaPairRDD<String, String> sessionid2AggrInfoRDD, 
 			final JSONObject taskParam,
-			final Accumulator<String> sessionAggrStatAccumulator) {  
+			final Accumulator<String> sessionAggrStatAccumulator){
 		// 为了使用我们后面的ValieUtils，所以，首先将所有的筛选参数拼接成一个连接串
 		// 此外，这里其实大家不要觉得是多此一举
-		// 其实我们是给后面的性能优化埋下了一个伏笔
+		// 其实我们是给后面的性能优化埋下了一个伏笔		
+		//开始年龄
 		String startAge = ParamUtils.getParam(taskParam, Constants.PARAM_START_AGE);
+		//结束年龄
 		String endAge = ParamUtils.getParam(taskParam, Constants.PARAM_END_AGE);
+		//professionals
 		String professionals = ParamUtils.getParam(taskParam, Constants.PARAM_PROFESSIONALS);
+		//城市
 		String cities = ParamUtils.getParam(taskParam, Constants.PARAM_CITIES);
+		//姓别
 		String sex = ParamUtils.getParam(taskParam, Constants.PARAM_SEX);
+		//搜索
 		String keywords = ParamUtils.getParam(taskParam, Constants.PARAM_KEYWORDS);
+		//categoryIds
 		String categoryIds = ParamUtils.getParam(taskParam, Constants.PARAM_CATEGORY_IDS);
 		
+		//字符串拼接
 		String _parameter = (startAge != null ? Constants.PARAM_START_AGE + "=" + startAge + "|" : "")
-				+ (endAge != null ? Constants.PARAM_END_AGE + "=" + endAge + "|" : "")
-				+ (professionals != null ? Constants.PARAM_PROFESSIONALS + "=" + professionals + "|" : "")
-				+ (cities != null ? Constants.PARAM_CITIES + "=" + cities + "|" : "")
-				+ (sex != null ? Constants.PARAM_SEX + "=" + sex + "|" : "")
-				+ (keywords != null ? Constants.PARAM_KEYWORDS + "=" + keywords + "|" : "")
-				+ (categoryIds != null ? Constants.PARAM_CATEGORY_IDS + "=" + categoryIds: "");
+				 + (endAge != null ? Constants.PARAM_END_AGE + "=" + endAge + "|" : "")
+				 + (professionals != null ? Constants.PARAM_PROFESSIONALS + "=" + professionals + "|" : "")
+					+ (cities != null ? Constants.PARAM_CITIES + "=" + cities + "|" : "")
+					+ (sex != null ? Constants.PARAM_SEX + "=" + sex + "|" : "")
+					+ (keywords != null ? Constants.PARAM_KEYWORDS + "=" + keywords + "|" : "")
+					+ (categoryIds != null ? Constants.PARAM_CATEGORY_IDS + "=" + categoryIds: "")
+				;
 		
-		if(_parameter.endsWith("\\|")) {
+		//如果拼接的字符串末尾是|开头就截取扔掉
+		if(_parameter.endsWith("\\|")){
 			_parameter = _parameter.substring(0, _parameter.length() - 1);
 		}
 		
+		//将拼接的字符串赋值为final类型的
 		final String parameter = _parameter;
 		
-		// 根据筛选参数进行过滤
-		JavaPairRDD<String, String> filteredSessionid2AggrInfoRDD = sessionid2AggrInfoRDD.filter(
-				
-				new Function<Tuple2<String,String>, Boolean>() {
-			
+		//根据筛选参数进行过滤
+		JavaPairRDD<String, String> filteredSessionid2AggrInfoRDD = 
+				sessionid2AggrInfoRDD.filter(new Function<Tuple2<String,String>, Boolean>() {
+					
+					/**
+					 * 
+					 */
 					private static final long serialVersionUID = 1L;
-			
+
 					@Override
-					public Boolean call(Tuple2<String, String> tuple) throws Exception {
-						// 首先，从tuple中，获取聚合数据
+					public Boolean call(Tuple2<String, String> tuple) 
+							throws Exception {
+						//首先，从tuple中，获取聚合数据
 						String aggrInfo = tuple._2;
 						
 						// 接着，依次按照筛选条件进行过滤
 						// 按照年龄范围进行过滤（startAge、endAge）
-						if(!ValidUtils.between(aggrInfo, Constants.FIELD_AGE, 
-								parameter, Constants.PARAM_START_AGE, Constants.PARAM_END_AGE)) {
-							return false;
+						if(!ValidUtils.between(aggrInfo, Constants.FIELD_AGE,
+								parameter, Constants.PARAM_START_AGE, 
+								Constants.PARAM_END_AGE)){
+							//如果不包含上面所述的字段，直接返回false
+							return false;			
 						}
 						
 						// 按照职业范围进行过滤（professionals）
 						// 互联网,IT,软件
 						// 互联网
 						if(!ValidUtils.in(aggrInfo, Constants.FIELD_PROFESSIONAL, 
-								parameter, Constants.PARAM_PROFESSIONALS)) {
+								parameter, Constants.PARAM_PROFESSIONALS)){
 							return false;
 						}
 						
 						// 按照城市范围进行过滤（cities）
 						// 北京,上海,广州,深圳
 						// 成都
-						if(!ValidUtils.in(aggrInfo, Constants.FIELD_CITY, 
-								parameter, Constants.PARAM_CITIES)) {
+						if(!ValidUtils.in(aggrInfo, Constants.FIELD_CITY, parameter, Constants.PARAM_CITIES)){
 							return false;
 						}
 						
 						// 按照性别进行过滤
 						// 男/女
 						// 男，女
-						if(!ValidUtils.equal(aggrInfo, Constants.FIELD_SEX, 
-								parameter, Constants.PARAM_SEX)) {
+						if(!ValidUtils.equal(aggrInfo, Constants.FIELD_SEX, parameter, Constants.PARAM_SEX)){
 							return false;
 						}
+						
 						
 						// 按照搜索词进行过滤
 						// 我们的session可能搜索了 火锅,蛋糕,烧烤
 						// 我们的筛选条件可能是 火锅,串串香,iphone手机
 						// 那么，in这个校验方法，主要判定session搜索的词中，有任何一个，与筛选条件中
 						// 任何一个搜索词相当，即通过
-						if(!ValidUtils.in(aggrInfo, Constants.FIELD_SEARCH_KEYWORDS, 
-								parameter, Constants.PARAM_KEYWORDS)) {
+						if(!ValidUtils.in(aggrInfo, Constants.FIELD_SEARCH_KEYWORDS, parameter, Constants.PARAM_KEYWORDS)){
 							return false;
 						}
 						
 						// 按照点击品类id进行过滤
-						if(!ValidUtils.in(aggrInfo, Constants.FIELD_CLICK_CATEGORY_IDS, 
-								parameter, Constants.PARAM_CATEGORY_IDS)) {
+						if(!ValidUtils.in(aggrInfo, Constants.FIELD_CLICK_CATEGORY_IDS, parameter, Constants.PARAM_CATEGORY_IDS)){
 							return false;
 						}
+						
 						
 						// 如果经过了之前的多个过滤条件之后，程序能够走到这里
 						// 那么就说明，该session是通过了用户指定的筛选条件的，也就是需要保留的session
 						// 那么就要对session的访问时长和访问步长，进行统计，根据session对应的范围
 						// 进行相应的累加计数
 						
-						// 主要走到这一步，那么就是需要计数的session
-						sessionAggrStatAccumulator.add(Constants.SESSION_COUNT);  
+						// 主要走到这一步，那么就是需要计数的session,session_count
+						sessionAggrStatAccumulator.add(Constants.SESSION_COUNT);
 						
 						// 计算出session的访问时长和访问步长的范围，并进行相应的累加
+						//visitLength
+						//long visitLength = Long.valueOf(StringUtils.getFieldFromConcatString(aggrInfo, "\\|", Constants.FIELD_VISIT_LENGTH));
+						//stepLength
+						//long stepLength = Long.valueOf(StringUtils.getFieldFromConcatString(aggrInfo, "\\|", Constants.FIELD_STEP_LENGTH));		
+							
+						//计算访问时长范围
+						//calculateVisitLength(visitLength); 
+						//计算访问步长范围
+						//calculateStepLength(stepLength); 
+						
 						long visitLength = Long.valueOf(StringUtils.getFieldFromConcatString(
 								aggrInfo, "\\|", Constants.FIELD_VISIT_LENGTH)); 
 						long stepLength = Long.valueOf(StringUtils.getFieldFromConcatString(
 								aggrInfo, "\\|", Constants.FIELD_STEP_LENGTH));  
 						calculateVisitLength(visitLength); 
-						calculateStepLength(stepLength);  
+						calculateStepLength(stepLength); 
 						
 						return true;
 					}
@@ -1040,41 +876,52 @@ public class UserVisitSessionAnalyzeSpark {
 							sessionAggrStatAccumulator.add(Constants.STEP_PERIOD_60);    
 						}
 					}
+
 					
 				});
+		
+		
 		
 		return filteredSessionid2AggrInfoRDD;
 	}
 	
 	/**
-	 * 获取通过筛选条件的session的访问明细数据RDD
+	 * 7、获取通过筛选条件的session的访问明细数据RDD
 	 * @param sessionid2aggrInfoRDD
 	 * @param sessionid2actionRDD
 	 * @return
 	 */
+	@SuppressWarnings("unused")
 	private static JavaPairRDD<String, Row> getSessionid2detailRDD(
 			JavaPairRDD<String, String> sessionid2aggrInfoRDD,
-			JavaPairRDD<String, Row> sessionid2actionRDD) {
+			JavaPairRDD<String, Row> sessionid2actionRDD){
+		
 		JavaPairRDD<String, Row> sessionid2detailRDD = sessionid2aggrInfoRDD
 				.join(sessionid2actionRDD)
 				.mapToPair(new PairFunction<Tuple2<String,Tuple2<String,Row>>, String, Row>() {
-		
+
+					/**
+					 * 
+					 */
 					private static final long serialVersionUID = 1L;
 
 					@Override
-					public Tuple2<String, Row> call(
-							Tuple2<String, Tuple2<String, Row>> tuple) throws Exception {
+					public Tuple2<String, Row> call(Tuple2<String, Tuple2<String, Row>> tuple) 
+							throws Exception {
+							
 						return new Tuple2<String, Row>(tuple._1, tuple._2._2);
 					}
-					
-				});
+		});
+		
 		return sessionid2detailRDD;
 	}
+	
 	
 	/**
 	 * 随机抽取session
 	 * @param sessionid2AggrInfoRDD  
 	 */
+	@SuppressWarnings("unused")
 	private static void randomExtractSession(
 			JavaSparkContext sc,
 			final long taskid,
@@ -1411,15 +1258,18 @@ public class UserVisitSessionAnalyzeSpark {
 				});
 	}
 	
+	
 	/**
-	 * 计算各session范围占比，并写入MySQL
+	 * 9、计算各session范围占比，并写入MySQL
 	 * @param value
 	 */
+	@SuppressWarnings("unused")
 	private static void calculateAndPersistAggrStat(String value, long taskid) {
 		// 从Accumulator统计串中获取值
 		long session_count = Long.valueOf(StringUtils.getFieldFromConcatString(
 				value, "\\|", Constants.SESSION_COUNT));  
 		
+		//访问时长
 		long visit_length_1s_3s = Long.valueOf(StringUtils.getFieldFromConcatString(
 				value, "\\|", Constants.TIME_PERIOD_1s_3s));  
 		long visit_length_4s_6s = Long.valueOf(StringUtils.getFieldFromConcatString(
@@ -1439,6 +1289,7 @@ public class UserVisitSessionAnalyzeSpark {
 		long visit_length_30m = Long.valueOf(StringUtils.getFieldFromConcatString(
 				value, "\\|", Constants.TIME_PERIOD_30m));
 		
+		//访问步长，从拼接的字符串中提取字段
 		long step_length_1_3 = Long.valueOf(StringUtils.getFieldFromConcatString(
 				value, "\\|", Constants.STEP_PERIOD_1_3));
 		long step_length_4_6 = Long.valueOf(StringUtils.getFieldFromConcatString(
@@ -1453,6 +1304,7 @@ public class UserVisitSessionAnalyzeSpark {
 				value, "\\|", Constants.STEP_PERIOD_60));
 		
 		// 计算各个访问时长和访问步长的范围
+		//格式化数字
 		double visit_length_1s_3s_ratio = NumberUtils.formatDouble(
 				(double)visit_length_1s_3s / (double)session_count, 2);  
 		double visit_length_4s_6s_ratio = NumberUtils.formatDouble(
@@ -1472,6 +1324,8 @@ public class UserVisitSessionAnalyzeSpark {
 		double visit_length_30m_ratio = NumberUtils.formatDouble(
 				(double)visit_length_30m / (double)session_count, 2);  
 		
+		//访问步长的范围
+		//格式化数字
 		double step_length_1_3_ratio = NumberUtils.formatDouble(
 				(double)step_length_1_3 / (double)session_count, 2);  
 		double step_length_4_6_ratio = NumberUtils.formatDouble(
@@ -1484,6 +1338,7 @@ public class UserVisitSessionAnalyzeSpark {
 				(double)step_length_30_60 / (double)session_count, 2);  
 		double step_length_60_ratio = NumberUtils.formatDouble(
 				(double)step_length_60 / (double)session_count, 2);  
+		
 		
 		// 将统计结果封装为Domain对象
 		SessionAggrStat sessionAggrStat = new SessionAggrStat();
@@ -1507,14 +1362,17 @@ public class UserVisitSessionAnalyzeSpark {
 		
 		// 调用对应的DAO插入统计结果
 		ISessionAggrStatDAO sessionAggrStatDAO = DaoFactory.getSessionAggrStatDAO();
+		//将统计的结果插入到数据表中session_aggr_stat
 		sessionAggrStatDAO.insert(sessionAggrStat);  
 	}
 	
+	
 	/**
-	 * 获取top10热门品类
+	 * 10、获取top10热门品类
 	 * @param filteredSessionid2AggrInfoRDD
 	 * @param sessionid2actionRDD
 	 */
+	@SuppressWarnings("unused")
 	private static List<Tuple2<CategorySortKey, String>> getTop10Category(  
 			long taskid,  
 			JavaPairRDD<String, Row> sessionid2detailRDD) {
@@ -1673,6 +1531,7 @@ public class UserVisitSessionAnalyzeSpark {
 		
 		return top10CategoryList;
 	}
+	
 	
 	/**
 	 * 获取各品类点击次数RDD
@@ -1972,6 +1831,7 @@ public class UserVisitSessionAnalyzeSpark {
 		return payCategoryId2CountRDD;
 	}
 	
+	
 	/**
 	 * 连接品类RDD与数据RDD
 	 * @param categoryidRDD
@@ -2073,11 +1933,13 @@ public class UserVisitSessionAnalyzeSpark {
 		return tmpMapRDD;
 	}
 	
+	
 	/**
 	 * 获取top10活跃session
 	 * @param taskid
 	 * @param sessionid2detailRDD
 	 */
+	@SuppressWarnings("unused")
 	private static void getTop10Session(
 			JavaSparkContext sc,
 			final long taskid,
@@ -2278,5 +2140,230 @@ public class UserVisitSessionAnalyzeSpark {
 			}
 		});
 	}
+	
+	
+	
+	public static void main(String[] args) {
+		//设置参数,仅供测试，测试结束，注释即可
+		args = new String[]{"1"};
+		
+		//构建spark的上下文
+		SparkConf sparkConf = new SparkConf();	
+		//设置SparkName的值UserVisitSessionAnalyzeSpark
+		sparkConf.setAppName(Constants.SPARK_APP_NAME_SESSION);
+		//设置本地模式
+		sparkConf.setMaster("local");
+		
+		//获取到sc,将配置信息传递给JavaSparkContext
+		JavaSparkContext sc = new JavaSparkContext(sparkConf);
+		//获取到是本地模式还是非本地模式
+		SQLContext sqlContext = getSQLContext(sc.sc());
+		
+		//生成模拟测试数据
+		SparkUtils.mockData(sc, sqlContext);
+	
+		//创建需要使用的dao组件
+		ITaskDao taskDao = DaoFactory.getTaskDao();
+		
+		//如果要进行session粒度的数据聚合，首先要从user_visit_action表中，查询出来指定日期范围内的行为数据
+		//如果要根据用户在创建任务时指定的参数，来进行数据过滤和筛选。
+		//那么就首先得查询出来指定的任务
+		//spark.local.taskid.session
+		Long taskid = ParamUtils.getTaskIdFromArgs(args, Constants.SPARK_LOCAL_TASKID_SESSION);
+		//然后根据taskid进行查询数据表操作，将查询的结果进行返回
+		Task task = taskDao.findById(taskid);
+		//如果task为null的时候
+		if(null == task){
+			System.out.println(new Date() 
+					+ ": cannot find this task with id [" + taskid + "].");  
+			//打印错误信息以后直接返回即可
+			return;
+		}
+		//将查询的结果转换为json格式的数据
+		JSONObject taskParam = JSONObject.parseObject(task.getTaskParam());
+		
+		// 如果要进行session粒度的数据聚合
+		// 首先要从user_visit_action表中，查询出来指定日期范围内的行为数据
+		
+		/**
+		 * actionRDD，就是一个公共RDD
+		 * 第一，要用ationRDD，获取到一个公共的sessionid为key的PairRDD
+		 * 第二，actionRDD，用在了session聚合环节里面
+		 * 
+		 * sessionid为key的PairRDD，是确定了，在后面要多次使用的
+		 * 1、与通过筛选的sessionid进行join，获取通过筛选的session的明细数据
+		 * 2、将这个RDD，直接传入aggregateBySession方法，进行session聚合统计
+		 * 
+		 * 重构完以后，actionRDD，就只在最开始，使用一次，用来生成以sessionid为key的RDD
+		 * 
+		 */
+		JavaRDD<Row> actionRDD = SparkUtils.getActionRDDByDateRange(sqlContext, taskParam);
+		//根据actionRDD获取到sessionid2ActionRDD
+		JavaPairRDD<String, Row> sessionid2ActionRDD = getSessionid2ActionRDD(actionRDD);
+		
+		/**
+		 * 持久化，很简单，就是对RDD调用persist()方法，并传入一个持久化级别
+		 * 
+		 * 如果是persist(StorageLevel.MEMORY_ONLY())，纯内存，无序列化，那么就可以用cache()方法来替代
+		 * StorageLevel.MEMORY_ONLY_SER()，第二选择
+		 * StorageLevel.MEMORY_AND_DISK()，第三选择
+		 * StorageLevel.MEMORY_AND_DISK_SER()，第四选择
+		 * StorageLevel.DISK_ONLY()，第五选择
+		 * 
+		 * 如果内存充足，要使用双副本高可靠机制
+		 * 选择后缀带_2的策略
+		 * StorageLevel.MEMORY_ONLY_2()
+		 * 
+		 */
+		//JavaPairRDD<String, Row> persist = sessionid2ActionRDD.persist(StorageLevel.MEMORY_ONLY());
+		//对sessionid2ActionRDD持久化操作
+		sessionid2ActionRDD = sessionid2ActionRDD.persist(StorageLevel.MEMORY_ONLY());
+		//sessionid2actionRDD.checkpoint();
+		
+		
+		// 首先，可以将行为数据，按照session_id进行groupByKey分组
+		// 此时的数据的粒度就是session粒度了，然后呢，可以将session粒度的数据
+		// 与用户信息数据，进行join
+		// 然后就可以获取到session粒度的数据，同时呢，数据里面还包含了session对应的user的信息
+		// 到这里为止，获取的数据是<sessionid,(sessionid,searchKeywords,clickCategoryIds,age,professional,city,sex)>  
+		JavaPairRDD<String, String> sessionid2AggrInfoRDD = 
+				aggregateBySession(sc, sqlContext, sessionid2ActionRDD);
+		
+		//单元测试,获取10条数据
+		System.out.println("过滤前行数：" +  sessionid2AggrInfoRDD.count());
+		for(Tuple2<String, String> tuple : sessionid2AggrInfoRDD.take(10)){
+			System.out.println("过滤前："  + ", " + tuple._2);
+		}
+		
+		// 接着，就要针对session粒度的聚合数据，按照使用者指定的筛选参数进行数据过滤
+		// 相当于我们自己编写的算子，是要访问外面的任务参数对象的
+		// 所以，大家记得我们之前说的，匿名内部类（算子函数），访问外部对象，是要给外部对象使用final修饰的
+		
+		// 重构，同时进行过滤和统计
+		Accumulator<String> sessionAggrStatAccumulator = sc.accumulator("", new SessionAggrStatAccumulator());
+		
+		//进行session过滤操作
+		JavaPairRDD<String, String> filteredSessionid2AggrInfoRDD = 
+				filterSessionAndAggrStat(sessionid2AggrInfoRDD, taskParam, sessionAggrStatAccumulator);
+		//设置级别
+		filteredSessionid2AggrInfoRDD = filteredSessionid2AggrInfoRDD.persist(StorageLevel.MEMORY_ONLY());
+		
+		//单元测试，过滤后数据输出
+		System.out.println("过滤后行数：" +  filteredSessionid2AggrInfoRDD.count());
+		for(Tuple2<String, String> tuple : filteredSessionid2AggrInfoRDD.take(10)){
+			System.out.println("过滤后："  + ", " + tuple._2);
+		}
+		
+		
+		// 生成公共的RDD：通过筛选条件的session的访问明细数据
+		
+		/**
+		 * 重构：sessionid2detailRDD，就是代表了通过筛选的session对应的访问明细数据
+		 */
+		//JavaPairRDD<String, Row> sessionid2detailRDD = 
+		//		getSessionid2detailRDD(filteredSessionid2AggrInfoRDD, sessionid2ActionRDD);
+		//设置级别，
+		//sessionid2detailRDD = sessionid2detailRDD.persist(StorageLevel.MEMORY_ONLY());
+		
+		
+		
+		/**
+		 * 对于Accumulator这种分布式累加计算的变量的使用，有一个重要说明
+		 * 
+		 * 从Accumulator中，获取数据，插入数据库的时候，一定要，一定要，是在有某一个action操作以后
+		 * 再进行。。。
+		 * 
+		 * 如果没有action的话，那么整个程序根本不会运行。。。
+		 * 
+		 * 是不是在calculateAndPersisitAggrStat方法之后，运行一个action操作，比如count、take
+		 * 不对！！！
+		 * 
+		 * 必须把能够触发job执行的操作，放在最终写入MySQL方法之前
+		 * 
+		 * 计算出来的结果，在J2EE中，是怎么显示的，是用两张柱状图显示
+		 */
+		//randomExtractSession(sc, task.getTaskid(), filteredSessionid2AggrInfoRDD, sessionid2detailRDD);
+		
+		/**
+		 * 特别说明
+		 * 我们知道，要将上一个功能的session聚合统计数据获取到，就必须是在一个action操作触发job之后
+		 * 才能从Accumulator中获取数据，否则是获取不到数据的，因为没有job执行，Accumulator的值为空
+		 * 所以，我们在这里，将随机抽取的功能的实现代码，放在session聚合统计功能的最终计算和写库之前
+		 * 因为随机抽取功能中，有一个countByKey算子，是action操作，会触发job
+		 */
+		// 计算出各个范围的session占比，并写入MySQL
+		//filteredSessionid2AggrInfoRDD.count();
+		
+		calculateAndPersistAggrStat(sessionAggrStatAccumulator.value(),
+						task.getTaskid());
+		/***
+		 * 代码至此，测试出现的问题，日期问题，比如格式如2018-05-03
+		 */
+		
+		
+		/**
+		 * session聚合统计（统计出访问时长和访问步长，各个区间的session数量占总session数量的比例）
+		 * 
+		 * 如果不进行重构，直接来实现，思路：
+		 * 1、actionRDD，映射成<sessionid,Row>的格式
+		 * 2、按sessionid聚合，计算出每个session的访问时长和访问步长，生成一个新的RDD
+		 * 3、遍历新生成的RDD，将每个session的访问时长和访问步长，去更新自定义Accumulator中的对应的值
+		 * 4、使用自定义Accumulator中的统计值，去计算各个区间的比例
+		 * 5、将最后计算出来的结果，写入MySQL对应的表中
+		 * 
+		 * 普通实现思路的问题：
+		 * 1、为什么还要用actionRDD，去映射？其实我们之前在session聚合的时候，映射已经做过了。多此一举
+		 * 2、是不是一定要，为了session的聚合这个功能，单独去遍历一遍session？其实没有必要，已经有session数据
+		 * 		之前过滤session的时候，其实，就相当于，是在遍历session，那么这里就没有必要再过滤一遍了
+		 * 
+		 * 重构实现思路：
+		 * 1、不要去生成任何新的RDD（处理上亿的数据）
+		 * 2、不要去单独遍历一遍session的数据（处理上千万的数据）
+		 * 3、可以在进行session聚合的时候，就直接计算出来每个session的访问时长和访问步长
+		 * 4、在进行过滤的时候，本来就要遍历所有的聚合session信息，此时，就可以在某个session通过筛选条件后
+		 * 		将其访问时长和访问步长，累加到自定义的Accumulator上面去
+		 * 5、就是两种截然不同的思考方式，和实现方式，在面对上亿，上千万数据的时候，甚至可以节省时间长达
+		 * 		半个小时，或者数个小时
+		 * 
+		 * 开发Spark大型复杂项目的一些经验准则：
+		 * 1、尽量少生成RDD
+		 * 2、尽量少对RDD进行算子操作，如果有可能，尽量在一个算子里面，实现多个需要做的功能
+		 * 3、尽量少对RDD进行shuffle算子操作，比如groupByKey、reduceByKey、sortByKey（map、mapToPair）
+		 * 		shuffle操作，会导致大量的磁盘读写，严重降低性能
+		 * 		有shuffle的算子，和没有shuffle的算子，甚至性能，会达到几十分钟，甚至数个小时的差别
+		 * 		有shfufle的算子，很容易导致数据倾斜，一旦数据倾斜，简直就是性能杀手（完整的解决方案）
+		 * 4、无论做什么功能，性能第一
+		 * 		在传统的J2EE或者.NET后者PHP，软件/系统/网站开发中，我认为是架构和可维护性，可扩展性的重要
+		 * 		程度，远远高于了性能，大量的分布式的架构，设计模式，代码的划分，类的划分（高并发网站除外）
+		 * 
+		 * 		在大数据项目中，比如MapReduce、Hive、Spark、Storm，我认为性能的重要程度，远远大于一些代码
+		 * 		的规范，和设计模式，代码的划分，类的划分；大数据，大数据，最重要的，就是性能
+		 * 		主要就是因为大数据以及大数据项目的特点，决定了，大数据的程序和项目的速度，都比较慢
+		 * 		如果不优先考虑性能的话，会导致一个大数据处理程序运行时间长度数个小时，甚至数十个小时
+		 * 		此时，对于用户体验，简直就是一场灾难
+		 * 		
+		 * 		所以，推荐大数据项目，在开发和代码的架构中，优先考虑性能；其次考虑功能代码的划分、解耦合
+		 * 
+		 * 		我们如果采用第一种实现方案，那么其实就是代码划分（解耦合、可维护）优先，设计优先
+		 * 		如果采用第二种方案，那么其实就是性能优先
+		 * 
+		 * 		讲了这么多，其实大家不要以为我是在岔开话题，大家不要觉得项目的课程，就是单纯的项目本身以及
+		 * 		代码coding最重要，其实项目，我觉得，最重要的，除了技术本身和项目经验以外；非常重要的一点，就是
+		 * 		积累了，处理各种问题的经验
+		 * 
+		 */
+		// 获取top10热门品类
+		//List<Tuple2<CategorySortKey, String>> top10CategoryList = 
+		//		getTop10Category(task.getTaskid(), sessionid2detailRDD);
+		
+		// 获取top10活跃session
+		//getTop10Session(sc, task.getTaskid(), 
+		//				top10CategoryList, sessionid2detailRDD);
+		
+		
+		//关闭SparkContext
+		sc.close();
+	}
+	
 	
 }

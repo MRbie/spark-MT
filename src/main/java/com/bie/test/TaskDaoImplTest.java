@@ -20,10 +20,10 @@ public class TaskDaoImplTest {
 		Object[] params = new Object[]{"张三","2018-5-1","2018-5-1","2018-5-10",
 				"管理员","良好","参数一"};
 		//执行插入操作
-		int flag = taskDao.insertTask(params);
+		/*int flag = taskDao.insertTask(params);
 		if(flag > 0){
 			System.out.println("插入成功");
-		}
+		}*/
 		
 		
 		//2、查询操作
