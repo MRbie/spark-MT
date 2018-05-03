@@ -1,7 +1,17 @@
 package com.bie.dao.factory;
 
+import com.bie.dao.ISessionAggrStatDAO;
+import com.bie.dao.ISessionDetailDAO;
+import com.bie.dao.ISessionRandomExtractDAO;
 import com.bie.dao.ITaskDao;
+import com.bie.dao.ITop10CategoryDAO;
+import com.bie.dao.ITop10SessionDAO;
+import com.bie.dao.impl.SessionAggrStatDAOImpl;
+import com.bie.dao.impl.SessionDetailDAOImpl;
+import com.bie.dao.impl.SessionRandomExtractDAOImpl;
 import com.bie.dao.impl.TaskDaoImpl;
+import com.bie.dao.impl.Top10CategoryDAOImpl;
+import com.bie.dao.impl.Top10SessionDAOImpl;
 
 /**
  * 
@@ -21,6 +31,25 @@ public class DaoFactory {
 		return new TaskDaoImpl();
 	}
 	
+	public static ISessionAggrStatDAO getSessionAggrStatDAO(){
+		return new SessionAggrStatDAOImpl();
+	}
 	
+	
+	public static ISessionDetailDAO getSessionDetailDAO(){
+		return new SessionDetailDAOImpl();
+	}
+	
+	public static ITop10CategoryDAO getTop10CategoryDAO(){
+		return new Top10CategoryDAOImpl();
+	}
+	
+	public static ITop10SessionDAO getTop10SessionDAO(){
+		return new Top10SessionDAOImpl();
+	}
+	
+	public static ISessionRandomExtractDAO getSessionRandomExtractDAO(){
+		return new SessionRandomExtractDAOImpl();
+	}
 	
 }

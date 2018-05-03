@@ -98,8 +98,10 @@ public class StringUtils {
 	 */
 	public static String setFieldInConcatString(String str, 
 			String delimiter, String field, String newFieldValue) {
+		//参数delimiter作为分隔符,进行分割操作
 		String[] fields = str.split(delimiter);
 		
+		//对分割好的字符数组进行操作
 		for(int i = 0; i < fields.length; i++) {
 			String fieldName = fields[i].split("=")[0];
 			if(fieldName.equals(field)) {
@@ -109,6 +111,7 @@ public class StringUtils {
 			}
 		}
 		
+		//遍历字符数组，然后进行|拼接操作
 		StringBuffer buffer = new StringBuffer("");
 		for(int i = 0; i < fields.length; i++) {
 			buffer.append(fields[i]);
