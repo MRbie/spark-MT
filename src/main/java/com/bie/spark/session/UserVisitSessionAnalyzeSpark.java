@@ -270,11 +270,11 @@ public class UserVisitSessionAnalyzeSpark {
 						endTime = actionTime;
 					}
 					
-					//
+					//actionTime在startTime之前
 					if(actionTime.before(startTime)){
 						startTime = actionTime;
 					}
-					//
+					//actionTime在startTime之后
 					if(actionTime.after(endTime)){
 						endTime = actionTime;
 					}
@@ -812,14 +812,14 @@ public class UserVisitSessionAnalyzeSpark {
 						
 						// 计算出session的访问时长和访问步长的范围，并进行相应的累加
 						//visitLength
-						//long visitLength = Long.valueOf(StringUtils.getFieldFromConcatString(aggrInfo, "\\|", Constants.FIELD_VISIT_LENGTH));
+						long visitLength = Long.valueOf(StringUtils.getFieldFromConcatString(aggrInfo, "\\|", Constants.FIELD_VISIT_LENGTH));
 						//stepLength
-						//long stepLength = Long.valueOf(StringUtils.getFieldFromConcatString(aggrInfo, "\\|", Constants.FIELD_STEP_LENGTH));		
+						long stepLength = Long.valueOf(StringUtils.getFieldFromConcatString(aggrInfo, "\\|", Constants.FIELD_STEP_LENGTH));		
 							
 						//计算访问时长范围
-						//calculateVisitLength(visitLength); 
+						calculateVisitLength(visitLength); 
 						//计算访问步长范围
-						//calculateStepLength(stepLength); 
+						calculateStepLength(stepLength); 
 						
 						return true;
 					}
@@ -1260,6 +1260,7 @@ public class UserVisitSessionAnalyzeSpark {
 		long session_count = Long.valueOf(StringUtils.getFieldFromConcatString(
 				value, "\\|", Constants.SESSION_COUNT));  
 		
+		//访问时长
 		long visit_length_1s_3s = Long.valueOf(StringUtils.getFieldFromConcatString(
 				value, "\\|", Constants.TIME_PERIOD_1s_3s));  
 		long visit_length_4s_6s = Long.valueOf(StringUtils.getFieldFromConcatString(
@@ -1279,6 +1280,7 @@ public class UserVisitSessionAnalyzeSpark {
 		long visit_length_30m = Long.valueOf(StringUtils.getFieldFromConcatString(
 				value, "\\|", Constants.TIME_PERIOD_30m));
 		
+		//访问步长，从拼接的字符串中提取字段
 		long step_length_1_3 = Long.valueOf(StringUtils.getFieldFromConcatString(
 				value, "\\|", Constants.STEP_PERIOD_1_3));
 		long step_length_4_6 = Long.valueOf(StringUtils.getFieldFromConcatString(
@@ -1293,6 +1295,7 @@ public class UserVisitSessionAnalyzeSpark {
 				value, "\\|", Constants.STEP_PERIOD_60));
 		
 		// 计算各个访问时长和访问步长的范围
+		//格式化数字
 		double visit_length_1s_3s_ratio = NumberUtils.formatDouble(
 				(double)visit_length_1s_3s / (double)session_count, 2);  
 		double visit_length_4s_6s_ratio = NumberUtils.formatDouble(
@@ -1312,6 +1315,8 @@ public class UserVisitSessionAnalyzeSpark {
 		double visit_length_30m_ratio = NumberUtils.formatDouble(
 				(double)visit_length_30m / (double)session_count, 2);  
 		
+		//访问步长的范围
+		//格式化数字
 		double step_length_1_3_ratio = NumberUtils.formatDouble(
 				(double)step_length_1_3 / (double)session_count, 2);  
 		double step_length_4_6_ratio = NumberUtils.formatDouble(
@@ -1324,6 +1329,7 @@ public class UserVisitSessionAnalyzeSpark {
 				(double)step_length_30_60 / (double)session_count, 2);  
 		double step_length_60_ratio = NumberUtils.formatDouble(
 				(double)step_length_60 / (double)session_count, 2);  
+		
 		
 		// 将统计结果封装为Domain对象
 		SessionAggrStat sessionAggrStat = new SessionAggrStat();
@@ -1347,6 +1353,7 @@ public class UserVisitSessionAnalyzeSpark {
 		
 		// 调用对应的DAO插入统计结果
 		ISessionAggrStatDAO sessionAggrStatDAO = DaoFactory.getSessionAggrStatDAO();
+		//将统计的结果插入到数据表中session_aggr_stat
 		sessionAggrStatDAO.insert(sessionAggrStat);  
 	}
 	
@@ -1356,6 +1363,7 @@ public class UserVisitSessionAnalyzeSpark {
 	 * @param filteredSessionid2AggrInfoRDD
 	 * @param sessionid2actionRDD
 	 */
+	@SuppressWarnings("unused")
 	private static List<Tuple2<CategorySortKey, String>> getTop10Category(  
 			long taskid,  
 			JavaPairRDD<String, Row> sessionid2detailRDD) {
@@ -1922,6 +1930,7 @@ public class UserVisitSessionAnalyzeSpark {
 	 * @param taskid
 	 * @param sessionid2detailRDD
 	 */
+	@SuppressWarnings("unused")
 	private static void getTop10Session(
 			JavaSparkContext sc,
 			final long taskid,
@@ -2127,7 +2136,7 @@ public class UserVisitSessionAnalyzeSpark {
 	
 	public static void main(String[] args) {
 		//设置参数,仅供测试，测试结束，注释即可
-		args = new String[]{"1"};
+		args = new String[]{"2"};
 		
 		//构建spark的上下文
 		SparkConf sparkConf = new SparkConf();	
@@ -2330,12 +2339,12 @@ public class UserVisitSessionAnalyzeSpark {
 		 * 
 		 */
 		// 获取top10热门品类
-		List<Tuple2<CategorySortKey, String>> top10CategoryList = 
-				getTop10Category(task.getTaskid(), sessionid2detailRDD);
+		//List<Tuple2<CategorySortKey, String>> top10CategoryList = 
+		//		getTop10Category(task.getTaskid(), sessionid2detailRDD);
 		
 		// 获取top10活跃session
-		getTop10Session(sc, task.getTaskid(), 
-						top10CategoryList, sessionid2detailRDD);
+		//getTop10Session(sc, task.getTaskid(), 
+		//				top10CategoryList, sessionid2detailRDD);
 		
 		
 		//关闭SparkContext
